@@ -11,6 +11,14 @@
 //   理論上可能（サーバー側で「本当にその手だったか」を検証しない）。
 //   本格的な不正対策が必要になったら、ここにダメージ計算ロジックを
 //   移植してサーバー権威型に強化できる（今回はその手前の段階）。
+//
+// ---- レイドバトル(2人協力)について ----
+// 1v1のPvPとは別に、レイドは「共有ボスHP」をサーバー側で権威的に
+// 管理する必要がある(クライアント側だけで持たせるとボスHPを
+// チートできてしまうため)。そのため、レイド関連の判定(勝敗・
+// ダメージ計算・ボスの手のランダム決定)は全てサーバー側で行う。
+// プレイヤー自身のステータス(hp/atk/winBonus)はクライアントが
+// 計算した値を送ってもらう(既存のsubmit_deckと同じ信頼レベル)。
 // ============================================================
 
 const express = require('express');
@@ -33,7 +41,7 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// ---- ルーム管理 ----
+// ---- ルーム管理(PvP) ----
 // rooms[code] = {
 //   code, players: [socketId, socketId?], names: {socketId: name},
 //   decks: {socketId: [{id,hp,atk}x3]}, hands: {socketId: 'rock'|'scissors'|'paper'},
@@ -47,7 +55,7 @@ function makeRoomCode() {
   let code;
   do {
     code = String(Math.floor(1000 + Math.random() * 9000));
-  } while (rooms[code]);
+  } while (rooms[code] || raidRooms[code]);
   return code;
 }
 
@@ -87,9 +95,174 @@ function leaveRoom(socket, { silent = false } = {}) {
   socket.data.roomId = null;
 }
 
+// ============================================================
+//  レイドバトル(2人協力・サーバー権威)
+// ============================================================
+
+// 難易度ごとのボス基礎スペック(企画書の数値をそのまま反映)
+// dmgPerWin = atk + winBonus (通常の勝利ダメージ)
+// ultPercent = 5ターンに1回の必殺技で、対象プレイヤーの「現在HP」に対して削る割合
+const RAID_BOSS_STATS = {
+  easy:   { hp: 300, atk: 6,  winBonus: 2,  ultPercent: 0.10 },
+  medium: { hp: 640, atk: 26, winBonus: 10, ultPercent: 0.30 },
+  hard:   { hp: 440, atk: 80, winBonus: 32, ultPercent: 0.50 },
+};
+const RAID_ULT_INTERVAL = 5; // 5ターンに1回
+
+// raidRooms[code] = {
+//   code, difficulty, players: [socketId, socketId],
+//   names: {socketId: name},
+//   playerCards: {socketId: {id, hp, maxHp, atk, winBonus, hand}}, // hand = 得意手
+//   boss: {hp, maxHp, atk, winBonus, ultPercent},
+//   turnCount: number,
+//   hands: {socketId: 'rock'|'scissors'|'paper'},
+//   started: bool, ended: bool,
+// }
+const raidRooms = {};
+// 難易度ごとの待機列: {easy: [...], medium: [...], hard: [...]}
+const raidQueues = { easy: [], medium: [], hard: [] };
+
+function removeFromRaidQueue(socketId) {
+  Object.keys(raidQueues).forEach((diff) => {
+    const q = raidQueues[diff];
+    const idx = q.findIndex((e) => e.socketId === socketId);
+    if (idx !== -1) q.splice(idx, 1);
+  });
+}
+
+function otherRaidPlayer(room, socketId) {
+  return room.players.find((id) => id !== socketId);
+}
+
+// じゃんけん判定: 'win' | 'lose' | 'draw' (aから見た結果)
+function judgeHand(a, b) {
+  if (a === b) return 'draw';
+  const beats = { rock: 'scissors', scissors: 'paper', paper: 'rock' };
+  return beats[a] === b ? 'win' : 'lose';
+}
+
+function cleanupRaidRoom(code) {
+  delete raidRooms[code];
+}
+
+function leaveRaidRoom(socket, { silent = false } = {}) {
+  const code = socket.data.raidRoomId;
+  if (!code) return;
+  const room = raidRooms[code];
+  if (room) {
+    const opponentId = otherRaidPlayer(room, socket.id);
+    if (opponentId && !silent && !room.ended) {
+      io.to(opponentId).emit('raid_opponent_left');
+    }
+    cleanupRaidRoom(code);
+  }
+  socket.leave(code);
+  socket.data.raidRoomId = null;
+}
+
+function startRaidRoom(idA, idB, nameA, nameB, difficulty) {
+  const code = makeRoomCode();
+  const bossSpec = RAID_BOSS_STATS[difficulty];
+  raidRooms[code] = {
+    code,
+    difficulty,
+    players: [idA, idB],
+    names: { [idA]: nameA, [idB]: nameB },
+    playerCards: {},
+    boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ultPercent: bossSpec.ultPercent },
+    turnCount: 0,
+    hands: {},
+    started: false,
+    ended: false,
+  };
+  [idA, idB].forEach((id) => {
+    const s = io.sockets.sockets.get(id);
+    if (s) { s.data.raidRoomId = code; s.join(code); }
+  });
+  const room = raidRooms[code];
+  room.players.forEach((id) => {
+    const oppId = otherRaidPlayer(room, id);
+    io.to(id).emit('raid_deck_select_start', {
+      difficulty,
+      players: [
+        { name: room.names[id] },
+        { name: room.names[oppId] },
+      ],
+    });
+  });
+}
+
+function resolveRaidTurn(room) {
+  const [idA, idB] = room.players;
+  const bossHand = ['rock', 'scissors', 'paper'][Math.floor(Math.random() * 3)];
+  room.turnCount += 1;
+  const isUltTurn = room.turnCount % RAID_ULT_INTERVAL === 0;
+
+  const results = {};
+  [idA, idB].forEach((id) => {
+    const card = room.playerCards[id];
+    const hand = room.hands[id];
+    const outcome = judgeHand(hand, bossHand); // cardから見た結果
+    let bossDamage = 0;
+    let playerDamage = 0;
+    if (outcome === 'win') {
+      bossDamage = card.atk + (hand === card.hand ? card.winBonus : 0);
+      room.boss.hp = Math.max(0, room.boss.hp - bossDamage);
+    } else if (outcome === 'lose') {
+      // ボスは得意手固定を持たない(毎ターンランダム)ので、勝った時は常にwinBonus込みで計算する
+      playerDamage = room.boss.atk + room.boss.winBonus;
+      card.hp = Math.max(0, card.hp - playerDamage);
+    }
+    results[id] = { hand, outcome, bossDamage, playerDamage, hpAfter: card.hp };
+  });
+
+  // 必殺技(5ターンに1回、両プレイヤーに現HPの割合ダメージ、回避不可)
+  let ultResults = null;
+  if (isUltTurn) {
+    ultResults = {};
+    [idA, idB].forEach((id) => {
+      const card = room.playerCards[id];
+      const dmg = Math.round(card.hp * room.boss.ultPercent);
+      card.hp = Math.max(0, card.hp - dmg);
+      ultResults[id] = { damage: dmg, hpAfter: card.hp };
+    });
+  }
+
+  room.hands = {};
+
+  const bossDefeated = room.boss.hp <= 0;
+  const playersDown = room.players.filter((id) => room.playerCards[id].hp <= 0);
+
+  room.players.forEach((id) => {
+    const oppId = otherRaidPlayer(room, id);
+    io.to(id).emit('raid_turn_result', {
+      bossHand,
+      turnCount: room.turnCount,
+      bossHp: room.boss.hp,
+      bossMaxHp: room.boss.maxHp,
+      you: results[id],
+      opponent: results[oppId],
+      ultimate: isUltTurn ? { you: ultResults[id], opponent: ultResults[oppId] } : null,
+      bossDefeated,
+      playersDown,
+    });
+  });
+
+  if (bossDefeated || playersDown.length > 0) {
+    room.ended = true;
+  }
+  return { bossDefeated, playersDown };
+}
+
+// ============================================================
+//  ソケット接続
+// ============================================================
+
 io.on('connection', (socket) => {
   socket.data.roomId = null;
+  socket.data.raidRoomId = null;
 
+  // ---- PvP(既存) ----
   socket.on('create_room', (data) => {
     try {
       const name = (data && data.name) || 'プレイヤー';
@@ -128,7 +301,6 @@ io.on('connection', (socket) => {
       const playersInfo = room.players.map((id) => ({ seat: seatFor(room, id), name: room.names[id] }));
       io.to(code).emit('lobby_update', { roomId: code, players: playersInfo });
 
-      // 2人揃ったのでデッキ選択へ（各ソケットに自分視点の相手名を個別送信）
       room.players.forEach((id) => {
         const oppId = otherPlayer(room, id);
         io.to(id).emit('deck_select_start', {
@@ -146,11 +318,10 @@ io.on('connection', (socket) => {
   socket.on('quick_match', (data) => {
     try {
       const name = (data && data.name) || 'プレイヤー';
-      removeFromQueue(socket.id); // 二重登録防止
+      removeFromQueue(socket.id);
 
       if (quickQueue.length > 0) {
         const partner = quickQueue.shift();
-        // マッチ成立: 新しいルームを作って2人を入れる
         const code = makeRoomCode();
         rooms[code] = {
           code,
@@ -193,7 +364,6 @@ io.on('connection', (socket) => {
       const code = socket.data.roomId;
       const room = rooms[code];
       if (!room) return;
-      // deck: [{id, hp, atk}, ...] — クライアントが計算済みのステータスをそのまま信頼する（リレー方式）
       room.decks[socket.id] = (data && data.deck) || [];
 
       if (room.players.length === 2 && room.players.every((id) => room.decks[id])) {
@@ -236,9 +406,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // クライアントが自分のローカル計算で対戦の決着を検知したら送ってくる
-  // （相手にも通知したいイベントは特にないが、退室時に「対戦中の切断」と
-  // 区別して opponent_left を誤発火させないためのフラグ管理に使う）
   socket.on('report_battle_end', () => {
     const code = socket.data.roomId;
     const room = rooms[code];
@@ -249,9 +416,91 @@ io.on('connection', (socket) => {
     leaveRoom(socket);
   });
 
+  // ---- レイドバトル(新規) ----
+  socket.on('quick_match_raid', (data) => {
+    try {
+      const name = (data && data.name) || 'プレイヤー';
+      const difficulty = (data && data.difficulty) || 'easy';
+      if (!RAID_BOSS_STATS[difficulty]) return;
+      removeFromRaidQueue(socket.id);
+
+      const queue = raidQueues[difficulty];
+      if (queue.length > 0) {
+        const partner = queue.shift();
+        startRaidRoom(partner.socketId, socket.id, partner.name, name, difficulty);
+      } else {
+        queue.push({ socketId: socket.id, name });
+        socket.emit('raid_quick_match_waiting');
+      }
+    } catch (e) {
+      console.error('[quick_match_raid]', e);
+    }
+  });
+
+  socket.on('cancel_quick_match_raid', () => {
+    removeFromRaidQueue(socket.id);
+  });
+
+  // data.card = { id, hp, atk, winBonus, hand } — アクティブカードのステータス
+  // (クライアント計算済みの値を信頼する。既存submit_deckと同じ信頼レベル)
+  socket.on('submit_raid_card', (data) => {
+    try {
+      const code = socket.data.raidRoomId;
+      const room = raidRooms[code];
+      if (!room) return;
+      const card = data && data.card;
+      if (!card || typeof card.hp !== 'number' || typeof card.atk !== 'number') return;
+      room.playerCards[socket.id] = { ...card, maxHp: card.hp };
+
+      if (room.players.length === 2 && room.players.every((id) => room.playerCards[id])) {
+        room.started = true;
+        room.players.forEach((id) => {
+          const oppId = otherRaidPlayer(room, id);
+          io.to(id).emit('raid_battle_start', {
+            yourCard: room.playerCards[id],
+            opponentCard: room.playerCards[oppId],
+            opponentName: room.names[oppId],
+            boss: room.boss,
+          });
+        });
+      }
+    } catch (e) {
+      console.error('[submit_raid_card]', e);
+    }
+  });
+
+  socket.on('submit_raid_hand', (data) => {
+    try {
+      const code = socket.data.raidRoomId;
+      const room = raidRooms[code];
+      if (!room || !room.started || room.ended) return;
+      const hand = data && data.hand;
+      if (!['rock', 'scissors', 'paper'].includes(hand)) return;
+      room.hands[socket.id] = hand;
+
+      if (room.players.length === 2 && room.players.every((id) => room.hands[id])) {
+        resolveRaidTurn(room);
+      }
+    } catch (e) {
+      console.error('[submit_raid_hand]', e);
+    }
+  });
+
+  socket.on('report_raid_end', () => {
+    const code = socket.data.raidRoomId;
+    const room = raidRooms[code];
+    if (room) room.ended = true;
+  });
+
+  socket.on('leave_raid_room', () => {
+    leaveRaidRoom(socket);
+  });
+
   socket.on('disconnect', () => {
     removeFromQueue(socket.id);
     leaveRoom(socket);
+    removeFromRaidQueue(socket.id);
+    leaveRaidRoom(socket);
   });
 });
 
