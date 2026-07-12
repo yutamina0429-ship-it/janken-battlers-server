@@ -117,16 +117,18 @@ const RAID_BOSS_REGISTRY = {
   astragal: {
     easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ult: { type: 'fixed', amount: 20 } },
     medium: { hp: 10000,  atk: 26, winBonus: 10, ult: { type: 'random', min: 50, max: 200 } },
-    hard:   { hp: 15000,  atk: 80, winBonus: 32, ult: { type: 'lethalRandom', min: 200 } },
+    hard:   { hp: 15000,  atk: 80, winBonus: 32, ult: { type: 'randomOrLethal', min: 200, max: 1000, lethalChance: 0.10 } },
   },
 };
 const RAID_ULT_INTERVAL = 5; // 5ターンに1回
 
 // ボスの必殺技ダメージを ult スペックから計算する。
-// percent:      現在HPの一定割合を削る(エレボス方式)
-// fixed:        固定ダメージ(現在HPが上限)
-// random:       min〜maxの一様ランダム(現在HPが上限)
-// lethalRandom: min〜現在HPの一様ランダム(現在HPが上限そのものなので、理論上は即死もあり得る)
+// percent:       現在HPの一定割合を削る(エレボス方式)
+// fixed:         固定ダメージ(現在HPが上限)
+// random:        min〜maxの一様ランダム(現在HPが上限)
+// lethalRandom:  min〜現在HPの一様ランダム(現在HPが上限そのものなので、理論上は即死もあり得る)
+// randomOrLethal: 通常はmin〜maxの一様ランダム、lethalChanceの確率で現在HP全部(即死)になる
+//                 (アストラガル上級「龍の息吹」: 200〜1000ダメージ、10%で即死)
 function computeUltDamage(ult, currentHp) {
   if (!ult || currentHp <= 0) return 0;
   switch (ult.type) {
@@ -141,6 +143,11 @@ function computeUltDamage(ult, currentHp) {
     case 'lethalRandom': {
       const max = Math.max(ult.min, currentHp);
       const dmg = ult.min + Math.floor(Math.random() * (max - ult.min + 1));
+      return Math.min(currentHp, dmg);
+    }
+    case 'randomOrLethal': {
+      if (Math.random() < ult.lethalChance) return currentHp; // 即死
+      const dmg = ult.min + Math.floor(Math.random() * (ult.max - ult.min + 1));
       return Math.min(currentHp, dmg);
     }
     default:
