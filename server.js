@@ -542,6 +542,34 @@ io.on('connection', (socket) => {
     if (room) room.ended = true;
   });
 
+  // プレイヤー必殺技: ダメージ計算はクライアント側(デッキ同様クライアント信頼のリレー方針)。
+  // サーバーはボスHPへの適用と両者への同報だけを担当する。
+  socket.on('use_raid_ult', (data) => {
+    try {
+      const code = socket.data.raidRoomId;
+      const room = raidRooms[code];
+      if (!room || !room.started || room.ended) return;
+      const damage = Math.max(0, Math.min(999999, Math.round((data && data.damage) || 0)));
+      if (!damage) return;
+      room.boss.hp = Math.max(0, room.boss.hp - damage);
+      const bossDefeated = room.boss.hp <= 0;
+      if (bossDefeated) room.ended = true;
+      const moveName = ((data && data.moveName) ? String(data.moveName) : '必殺技').slice(0, 40);
+      room.players.forEach((id) => {
+        io.to(id).emit('raid_ult_used', {
+          byYou: id === socket.id,
+          moveName,
+          damage,
+          bossHp: room.boss.hp,
+          bossMaxHp: room.boss.maxHp,
+          bossDefeated,
+        });
+      });
+    } catch (e) {
+      console.error('[use_raid_ult]', e);
+    }
+  });
+
   socket.on('leave_raid_room', () => {
     leaveRaidRoom(socket);
   });
