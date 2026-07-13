@@ -187,6 +187,25 @@ function otherRaidPlayer(room, socketId) {
   return room.players.find((id) => id !== socketId);
 }
 
+// 戦闘中に離脱したプレイヤーをCPU代行に切り替える。部屋は壊さず続行する。
+function convertRaidPlayerToCpu(room, socketId) {
+  if (!room || room.cpuControlled[socketId]) return;
+  room.cpuControlled[socketId] = true;
+  const oppId = otherRaidPlayer(room, socketId);
+  if (oppId) {
+    io.to(oppId).emit('raid_partner_cpu_takeover', { name: room.names[socketId] });
+  }
+}
+
+// CPU代行中のプレイヤーで、まだ今ターンの手を出していない相手にランダムな手を割り当てる。
+function autoFillCpuRaidHands(room) {
+  room.players.forEach((id) => {
+    if (room.cpuControlled[id] && !room.hands[id]) {
+      room.hands[id] = ['rock', 'scissors', 'paper'][Math.floor(Math.random() * 3)];
+    }
+  });
+}
+
 // じゃんけん判定: 'win' | 'lose' | 'draw' (aから見た結果)
 function judgeHand(a, b) {
   if (a === b) return 'draw';
@@ -203,11 +222,25 @@ function leaveRaidRoom(socket, { silent = false } = {}) {
   if (!code) return;
   const room = raidRooms[code];
   if (room) {
-    const opponentId = otherRaidPlayer(room, socket.id);
-    if (opponentId && !silent && !room.ended) {
-      io.to(opponentId).emit('raid_opponent_left');
+    if (room.started && !room.ended) {
+      // 戦闘中の離脱: 部屋を壊さず、抜けた側をCPU代行にして続行させる。
+      convertRaidPlayerToCpu(room, socket.id);
+      autoFillCpuRaidHands(room);
+      if (room.players.length === 2 && room.players.every((id) => room.hands[id])) {
+        resolveRaidTurn(room);
+      }
+      // 両者ともCPU代行(=誰も残っていない)になったら部屋を片付ける
+      if (room.players.every((id) => room.cpuControlled[id])) {
+        cleanupRaidRoom(code);
+      }
+    } else {
+      // マッチング中/デッキ選択中の離脱はこれまで通り即終了
+      const opponentId = otherRaidPlayer(room, socket.id);
+      if (opponentId && !silent && !room.ended) {
+        io.to(opponentId).emit('raid_opponent_left');
+      }
+      cleanupRaidRoom(code);
     }
-    cleanupRaidRoom(code);
   }
   socket.leave(code);
   socket.data.raidRoomId = null;
@@ -227,6 +260,7 @@ function startRaidRoom(idA, idB, nameA, nameB, bossId, difficulty) {
     boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult },
     turnCount: 0,
     hands: {},
+    cpuControlled: {}, // socketId -> true になったら、そのプレイヤーの手は毎ターン自動で埋める
     started: false,
     ended: false,
   };
@@ -529,6 +563,69 @@ io.on('connection', (socket) => {
     removeFromRaidQueue(socket.id);
   });
 
+  // ---- レイド: 部屋番号での対戦(クイックマッチと別ルート) ----
+  socket.on('create_raid_room', (data) => {
+    try {
+      const name = (data && data.name) || 'プレイヤー';
+      const bossId = (data && data.bossId) || 'erebos';
+      const difficulty = (data && data.difficulty) || 'easy';
+      const bossSpecs = RAID_BOSS_REGISTRY[bossId];
+      if (!bossSpecs || !bossSpecs[difficulty]) return;
+      const bossSpec = bossSpecs[difficulty];
+      const code = makeRoomCode();
+      raidRooms[code] = {
+        code,
+        bossId,
+        difficulty,
+        players: [socket.id],
+        names: { [socket.id]: name },
+        playerDecks: {},
+        activeIdx: {},
+        boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult },
+        turnCount: 0,
+        hands: {},
+        cpuControlled: {},
+        started: false,
+        ended: false,
+      };
+      socket.data.raidRoomId = code;
+      socket.join(code);
+      socket.emit('raid_room_created', { roomId: code, bossId, difficulty });
+    } catch (e) {
+      console.error('[create_raid_room]', e);
+    }
+  });
+
+  socket.on('join_raid_room', (data) => {
+    try {
+      const code = data && data.code;
+      const name = (data && data.name) || 'プレイヤー';
+      const room = raidRooms[code];
+      if (!room) { socket.emit('raid_join_error', { reason: 'ROOM_NOT_FOUND' }); return; }
+      if (room.players.length >= 2) { socket.emit('raid_join_error', { reason: 'ROOM_FULL' }); return; }
+      if (room.started) { socket.emit('raid_join_error', { reason: 'ALREADY_STARTED' }); return; }
+
+      room.players.push(socket.id);
+      room.names[socket.id] = name;
+      socket.data.raidRoomId = code;
+      socket.join(code);
+
+      room.players.forEach((id) => {
+        const oppId = otherRaidPlayer(room, id);
+        io.to(id).emit('raid_deck_select_start', {
+          bossId: room.bossId,
+          difficulty: room.difficulty,
+          players: [
+            { name: room.names[id] },
+            { name: room.names[oppId] },
+          ],
+        });
+      });
+    } catch (e) {
+      console.error('[join_raid_room]', e);
+    }
+  });
+
   // data.deck = [{ id, hp, atk, winBonus, hand }, x3] — 3枚のステータス
   // (クライアント計算済みの値を信頼する。既存submit_deckと同じ信頼レベル)
   socket.on('submit_raid_deck', (data) => {
@@ -585,6 +682,7 @@ io.on('connection', (socket) => {
       const hand = data && data.hand;
       if (!['rock', 'scissors', 'paper'].includes(hand)) return;
       room.hands[socket.id] = hand;
+      autoFillCpuRaidHands(room);
 
       if (room.players.length === 2 && room.players.every((id) => room.hands[id])) {
         resolveRaidTurn(room);
