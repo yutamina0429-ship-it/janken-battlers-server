@@ -257,7 +257,7 @@ function startRaidRoom(idA, idB, nameA, nameB, bossId, difficulty) {
     names: { [idA]: nameA, [idB]: nameB },
     playerDecks: {},   // socketId -> [{id,hp,maxHp,atk,winBonus,hand}, x3]
     activeIdx: {},     // socketId -> current active card index (0-2)
-    boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult },
+    boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult, poisonDmg: 0, poisonTurns: 0, atkDebuff: 0, atkDebuffTurns: 0 },
     turnCount: 0,
     hands: {},
     cpuControlled: {}, // socketId -> true になったら、そのプレイヤーの手は毎ターン自動で埋める
@@ -296,6 +296,19 @@ function ensureAliveActive(room, socketId) {
 
 function resolveRaidTurn(room) {
   const [idA, idB] = room.players;
+
+  // 侵食(毎ターンダメージ)をこのターンの頭で処理。デバフの残りターンもここで減らす。
+  let bossPoisonTick = 0;
+  if (room.boss.poisonTurns > 0) {
+    bossPoisonTick = room.boss.poisonDmg;
+    room.boss.hp = Math.max(0, room.boss.hp - bossPoisonTick);
+    room.boss.poisonTurns -= 1;
+  }
+  if (room.boss.atkDebuffTurns > 0) {
+    room.boss.atkDebuffTurns -= 1;
+    if (room.boss.atkDebuffTurns <= 0) room.boss.atkDebuff = 0;
+  }
+
   const bossHand = ['rock', 'scissors', 'paper'][Math.floor(Math.random() * 3)];
   room.turnCount += 1;
   const isUltTurn = room.turnCount % RAID_ULT_INTERVAL === 0;
@@ -313,7 +326,9 @@ function resolveRaidTurn(room) {
       room.boss.hp = Math.max(0, room.boss.hp - bossDamage);
     } else if (outcome === 'lose') {
       // ボスは得意手固定を持たない(毎ターンランダム)ので、勝った時は常にwinBonus込みで計算する
-      playerDamage = room.boss.atk + room.boss.winBonus;
+      // 一時ATKデバフがかかっていれば、そのぶんボスの攻撃力を減らして計算する
+      const effectiveAtk = Math.max(1, room.boss.atk - (room.boss.atkDebuff || 0));
+      playerDamage = effectiveAtk + room.boss.winBonus;
       card.hp = Math.max(0, card.hp - playerDamage);
     }
     results[id] = { hand, outcome, bossDamage, playerDamage, cardIdx: idx, hpAfter: card.hp, cardKO: card.hp <= 0 };
@@ -357,6 +372,7 @@ function resolveRaidTurn(room) {
       turnCount: room.turnCount,
       bossHp: room.boss.hp,
       bossMaxHp: room.boss.maxHp,
+      bossPoisonTick: bossPoisonTick || null,
       you: results[id],
       opponent: results[oppId],
       ultimate: isUltTurn ? { you: ultResults[id], opponent: ultResults[oppId] } : null,
@@ -581,7 +597,7 @@ io.on('connection', (socket) => {
         names: { [socket.id]: name },
         playerDecks: {},
         activeIdx: {},
-        boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult },
+        boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult, poisonDmg: 0, poisonTurns: 0, atkDebuff: 0, atkDebuffTurns: 0 },
         turnCount: 0,
         hands: {},
         cpuControlled: {},
@@ -699,14 +715,27 @@ io.on('connection', (socket) => {
   });
 
   // プレイヤー必殺技: ダメージ計算はクライアント側(デッキ同様クライアント信頼のリレー方針)。
-  // サーバーはボスHPへの適用と両者への同報だけを担当する。
+  // サーバーはボスHP/状態異常への適用と両者への同報だけを担当する。
   socket.on('use_raid_ult', (data) => {
     try {
       const code = socket.data.raidRoomId;
       const room = raidRooms[code];
       if (!room || !room.started || room.ended) return;
       const damage = Math.max(0, Math.min(999999, Math.round((data && data.damage) || 0)));
-      if (!damage) return;
+
+      // 侵食(毎ターンダメージ)・一時ATKデバフの付与(どちらもオプション)
+      const poison = data && data.poison;
+      if (poison && poison.dmg > 0 && poison.turns > 0) {
+        room.boss.poisonDmg = Math.max(0, Math.min(9999, Math.round(poison.dmg)));
+        room.boss.poisonTurns = Math.max(0, Math.min(20, Math.round(poison.turns)));
+      }
+      const tempAtkDebuff = data && data.tempAtkDebuff;
+      if (tempAtkDebuff && tempAtkDebuff.amount > 0 && tempAtkDebuff.turns > 0) {
+        room.boss.atkDebuff = Math.max(0, Math.min(9999, Math.round(tempAtkDebuff.amount)));
+        room.boss.atkDebuffTurns = Math.max(0, Math.min(20, Math.round(tempAtkDebuff.turns)));
+      }
+
+      if (!damage && !poison && !tempAtkDebuff) return; // 何も効果が無ければ無視
       room.boss.hp = Math.max(0, room.boss.hp - damage);
       const bossDefeated = room.boss.hp <= 0;
       if (bossDefeated) room.ended = true;
@@ -716,6 +745,8 @@ io.on('connection', (socket) => {
           byYou: id === socket.id,
           moveName,
           damage,
+          poison: poison || null,
+          tempAtkDebuff: tempAtkDebuff || null,
           bossHp: room.boss.hp,
           bossMaxHp: room.boss.maxHp,
           bossDefeated,
